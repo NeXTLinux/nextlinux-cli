@@ -1,0 +1,495 @@
+# CircleCI 2.1 configuration file
+# Check https://circleci.com/docs/2.0/configuration-reference/ for more details
+#
+# Note: YAML anchors allow an object to be re-used, reducing duplication.
+# The ampersand declares an alias for an object, then later the `<<: *name`
+# syntax dereferences it.
+#
+# Define YAML anchors
+parameters:
+  force_trigger_nightly_build:
+    type: boolean
+    default: false
+
+.global_environment_vars: &global_environment_vars
+  PROD_IMAGE_REPO: nextlinux/engine-cli
+  LATEST_RELEASE_MAJOR_VERSION: 0.9
+  TERM: xterm
+
+.attach_workspace: &attach_workspace
+  attach_workspace:
+    at: /home/circleci/workspace/
+
+.load_docker_image: &load_docker_image
+  run:
+    name: Load Docker image layer cache
+    command: |
+      docker load -i "/home/circleci/workspace/caches/${CIRCLE_SHA1}.tar" || true
+
+.ssh_forward_port: &ssh_forward_port
+  run:
+    name: Forward remote-docker ports for testing
+    command: |
+      ssh -MS nextlinux-api -fN4 -L 8228:localhost:8228 remote-docker
+      ssh -MS k8s-api -fN4 -L 32768:localhost:32768 remote-docker
+
+.filter_rc_tags: &filter_rc_tags
+  branches:
+    ignore: /.*/
+  tags:
+    only: /^v[0-9]+(\.[0-9]+)*-rc[0-9]+$/
+
+.filter_rebuild_tags: &filter_rebuild_tags
+  branches:
+    ignore: /.*/
+  tags:
+    only: /^v[0-9]+(\.[0-9]+)*-r[0-9]+$/
+
+.filter_release_branch: &filter_release_branch
+  branches:
+    only:
+      - /^[0-9]+(\.[0-9]+)$/
+      - master
+      - /^ci-.*/
+      - /^v[0-9]+(\.[0-9]+)*-dev$/
+
+.filter_semver_tags: &filter_semver_tags
+  branches:
+    ignore: /.*/
+  tags:
+    only: /^v[0-9]+(\.[0-9]+)*$/
+
+.filter_nightly: &filter_nightly
+  branches:
+    only:
+      - master
+
+# Start circleci configuration
+version: 2.1
+orbs:
+  slack: circleci/slack@4.5
+  grype: nextlinux/grype@0.2.0
+
+commands:
+  run_tests:
+    description: |
+      Uses make script to run tests
+      Saves the tox cache & stores log output as artifacts
+    parameters:
+      test_type:
+        type: string
+    steps:
+      - restore_cache:
+          keys:
+            - v1-dependencies-{{ .Branch }}-{{ checksum "requirements.txt" }}
+      - run:
+          name: run tests
+          command: make << parameters.test_type >>
+      - save_cache:
+          paths:
+            - ~/project/.tox
+          key: v1-dependencies-{{ .Branch }}-{{ checksum "requirements.txt" }}
+      - store_test_results:
+          path: .tox/results
+      - store_artifacts:
+          path: .tox/test-reports.log
+          destination: test-reports.log
+
+jobs:
+  lint:
+    parameters:
+      py_version:
+        type: string
+    docker:
+      - image: circleci/python:<<parameters.py_version>>
+    environment: *global_environment_vars
+    steps:
+      - checkout
+      - run:
+          name: run linter
+          command: make lint
+
+  unit_tests:
+    description: Uses make script to run unit tests on specified tox environment
+    parameters:
+      tox_env:
+        type: string
+      py_version:
+        type: string
+    docker:
+      - image: circleci/python:<<parameters.py_version>>
+    environment: *global_environment_vars
+    steps:
+      - checkout
+      - run_tests:
+          test_type: test-unit TOX_ENV="<< parameters.tox_env >>"
+
+  functional_tests:
+    description: Uses make script to run functional tests on specified tox environment
+    parameters:
+      tox_env:
+        type: string
+      py_version:
+        type: string
+    docker:
+      - image: circleci/python:<<parameters.py_version>>
+    resource_class: large
+    environment: *global_environment_vars
+    steps:
+      - setup_remote_docker
+      - checkout
+      - <<: *ssh_forward_port
+      - run_tests:
+          test_type: test-functional TOX_ENV="<< parameters.tox_env >>"
+
+  build:
+    docker:
+      - image: circleci/python:3.8
+    resource_class: large
+    environment: *global_environment_vars
+    steps:
+      - setup_remote_docker
+      - checkout
+      - run:
+          name: Build Docker image
+          command: make build
+      - run:
+          name: Save image to workspace
+          command: |
+            rm -rf /home/circleci/workspace/caches/
+            mkdir -p /home/circleci/workspace/caches/
+            docker save -o "/home/circleci/workspace/caches/${CIRCLE_SHA1}.tar" ${CIRCLE_PROJECT_REPONAME}:dev
+      - persist_to_workspace:
+          root: /home/circleci/workspace/
+          paths:
+            - caches/*
+
+  e2e_tests:
+    parameters:
+      py_version:
+        type: string
+    docker:
+      - image: circleci/python:<<parameters.py_version>>
+    resource_class: large
+    environment: *global_environment_vars
+    steps:
+      - setup_remote_docker
+      - checkout
+      - <<: *attach_workspace
+      - <<: *load_docker_image
+      - <<: *ssh_forward_port
+      - run:
+          name: Run e2e tests
+          command: make setup-and-test-e2e
+
+  push_image:
+    description: Uses make script to push images to DockerHub - dev, rc, prod
+    parameters:
+      make_job:
+        type: string
+    docker:
+      - image: circleci/python:3.8
+    environment: *global_environment_vars
+    steps:
+      - setup_remote_docker
+      - checkout
+      - <<: *attach_workspace
+      - <<: *load_docker_image
+      - run:
+          name: Push to Dockerhub
+          command: make << parameters.make_job >>
+      - slack/notify:
+          event: pass
+          tag_pattern: ^v[0-9]+(\.[0-9]+)*$
+          mentions: '@platform-one-team'
+          custom: |
+            {
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": "An image has shipped! :nextlinux::rocket:",
+                    "emoji": true
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Project*:\n$CIRCLE_PROJECT_REPONAME"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*When*:\n$(date +'%m/%d/%Y %T')"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Tag*:\n$CIRCLE_TAG"
+                    }
+                  ],
+                  "accessory": {
+                    "type": "image",
+                    "image_url": "https://assets.brandfolder.com/otz5mn-bw4j2w-6jzqo8/original/circle-logo-badge-black.png",
+                    "alt_text": "CircleCI logo"
+                  }
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "View Source"
+                      },
+                      "url": "https://github.com/nextlinux/${CIRCLE_PROJECT_REPONAME}/tree/${CIRCLE_TAG}"
+                    }
+                  ]
+                },
+                {
+                  "type": "divider"
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Image:*\n```docker pull docker.io/${PROD_IMAGE_REPO}:${CIRCLE_TAG}```"
+                  }
+                }
+              ]
+            }
+
+  ironbank-artifacts:
+    description: Use make script to create ironbank artifacts & push up to s3
+    docker:
+      - image: circleci/python:3.8
+    environment: *global_environment_vars
+    steps:
+      - setup_remote_docker
+      - checkout
+      - run:
+          name: create ironbank artifacts
+          command: make ironbank-artifacts
+
+  grype_vuln_scan:
+    description: "Uses grype orb for vuln scans"
+    parameters:
+      image_name:
+        type: string
+        default: "docker:nextlinux-cli:dev"
+    docker:
+      - image: cimg/python:3.8.4
+    steps:
+      - setup_remote_docker
+      - checkout
+      - <<: *attach_workspace
+      - <<: *load_docker_image
+      - run:
+          name: Login to Registry
+          command: "echo ${DOCKER_PASS} | docker login --username ${DOCKER_USER} --password-stdin"
+      - grype/scan-image:
+          image-name: << parameters.image_name >>
+          output-format: "table"
+      - run:
+          name: List Grype Vulns
+          command: "cat grype-vulns.output"
+
+workflows:
+  default_workflow:
+    when:
+      not:
+        equal: [ scheduled_pipeline, << pipeline.trigger_source >> ]
+    jobs:
+      - lint:
+          py_version: "3.8"
+      - unit_tests:
+          name: unit_tests_38
+          py_version: "3.8"
+          tox_env: "py27 py38"
+      - functional_tests:
+          name: functional_tests_38_latest
+          tox_env: py38-nextlinux_latest
+          py_version: "3.8"
+          requires:
+            - lint
+            - unit_tests_38
+      - build:
+          requires:
+            - functional_tests_38_latest
+      - push_image:
+          name: push_dev_image
+          make_job: push-dev
+          context: dockerhub
+          filters: *filter_release_branch
+          requires:
+            - build
+
+      - grype_vuln_scan:
+          context: dockerhub
+          requires:
+            - build
+
+  nightly_build:
+    when:
+      or:
+        - and:
+            - equal: [ scheduled_pipeline, << pipeline.trigger_source >> ]
+            - equal: [ "nightly_build", << pipeline.schedule.name >> ]
+        - << pipeline.parameters.force_trigger_nightly_build >>
+    jobs:
+      - lint:
+          py_version: "3.8"
+          filters: *filter_nightly
+      - unit_tests:
+          name: unit_tests_38
+          py_version: "3.8"
+          tox_env: "py27 py38"
+      - functional_tests:
+          filters: *filter_nightly
+          name: functional_tests_38_latest
+          tox_env: py38-nextlinux_latest
+          py_version: "3.8"
+          requires:
+            - lint
+            - unit_tests_38
+      - build:
+          filters: *filter_nightly
+          requires:
+            - functional_tests_38_latest
+      - e2e_tests:
+          context: e2e-testing
+          filters: *filter_nightly
+          py_version: "3.8"
+          requires:
+            - build
+      - push_image:
+          name: push_nightly_image
+          make_job: push-nightly
+          context: dockerhub
+          filters: *filter_nightly
+          requires:
+            - e2e_tests
+      - grype_vuln_scan:
+          context: dockerhub
+          requires:
+            - push_nightly_image
+
+  rc_image_workflow:
+    when:
+      not:
+        equal: [ scheduled_pipeline, << pipeline.trigger_source >> ]
+    jobs:
+      - build:
+          filters: *filter_rc_tags
+      - e2e_tests:
+          name: rc_e2e_tests
+          context: e2e-testing
+          filters: *filter_rc_tags
+          py_version: "3.8"
+          requires:
+            - build
+      - push_image:
+          name: push_rc_image
+          make_job: push-rc
+          context: dockerhub
+          filters: *filter_rc_tags
+          requires:
+            - rc_e2e_tests
+      - grype_vuln_scan:
+          context: dockerhub
+          requires:
+            - push_rc_image
+
+  prod_image_workflow:
+    when:
+      not:
+        equal: [ scheduled_pipeline, << pipeline.trigger_source >> ]  
+    jobs:
+      - e2e_tests:
+          name: prod_e2e_tests
+          context: e2e-testing
+          filters: *filter_semver_tags
+          py_version: "3.8"
+      - slack/on-hold:
+          context: slack-bot
+          channel: 'C01NA1QMYCF'
+          mentions: '@engineeringops-team'
+          filters: *filter_semver_tags
+          requires:
+            - prod_e2e_tests
+      - hold_for_approval:
+          type: approval
+          filters: *filter_semver_tags
+          requires:
+            - prod_e2e_tests
+      - push_image:
+          name: push_prod_image
+          make_job: push-prod
+          context: 
+            - dockerhub-prod
+            - slack-bot
+          filters: *filter_semver_tags
+          requires:
+            - hold_for_approval
+      - ironbank-artifacts:
+          context: aws-prod
+          filters: *filter_semver_tags
+          requires:
+            - hold_for_approval
+
+  rebuild_image_workflow:
+    when:
+      not:
+        equal: [ scheduled_pipeline, << pipeline.trigger_source >> ]
+    jobs:
+      - lint:
+          py_version: "3.8"
+          filters: *filter_rebuild_tags
+      - unit_tests:
+          name: unit_tests_38
+          py_version: "3.8"
+          tox_env: "py27 py38"
+          filters: *filter_rebuild_tags
+      - functional_tests:
+          filters: *filter_rebuild_tags
+          name: functional_tests_38_latest
+          tox_env: py38-nextlinux_latest
+          py_version: "3.8"
+          requires:
+            - lint
+            - unit_tests_38
+      - build:
+          filters: *filter_rebuild_tags
+          requires:
+            - functional_tests_38_latest
+      - e2e_tests:
+          context: e2e-testing
+          filters: *filter_rebuild_tags
+          py_version: "3.8"
+          requires:
+            - build
+      - push_image:
+          name: push_dev_image
+          make_job: push-dev
+          context: dockerhub
+          filters: *filter_rebuild_tags
+          requires:
+            - e2e_tests
+      - grype_vuln_scan:
+          context: dockerhub
+          requires:
+            - push_dev_image
+      - hold_for_approval:
+          type: approval
+          filters: *filter_rebuild_tags
+          requires:
+            - grype_vuln_scan
+      - push_image:
+          name: push_rebuild_image
+          make_job: push-rebuild
+          context: dockerhub-prod
+          filters: *filter_rebuild_tags
+          requires:
+            - hold_for_approval
