@@ -1,0 +1,15 @@
+FROM python:2-alpine
+
+LABEL "Maintainer"="connect@next-linux.systems"
+LABEL "Source"="https://github.com/nextlinux/nextlinux-cli"
+
+# Default values that should be overridden in most cases on each container exec
+ENV NEXTLINUX_CLI_USER=""
+ENV NEXTLINUX_CLI_PASS=""
+ENV NEXTLINUX_CLI_URL=http://localhost:8228/v1/
+ENV LANG=C.UTF-8
+ENV LC_ALL=C.UTF-8
+
+RUN pip install nextlinuxcli
+
+CMD ["/bin/sh"]
