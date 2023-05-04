@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+
+# Optional - only used for print_colorized
+source nextlinux-ci/utils
+
+exec_nextlinuxcli="kubectl exec nextlinux-cli -- nextlinux-cli --u admin --p foobar --url http://e2e-testing-nextlinux-engine-api:8228/v1/"
+
+print_colorized INFO "Running Nextlinux CLI end-to-end tests."; echo
+
+eval "${exec_nextlinuxcli} --version"
+eval "${exec_nextlinuxcli} system wait --timeout 300 --interval 10 --feedsready '' --servicesready 'catalog,apiext,policy_engine,simplequeue,analyzer'"
+eval "${exec_nextlinuxcli} system status"
+
+python tests/e2e/aetest.py docker.io/alpine:latest "${exec_nextlinuxcli}"
+python tests/e2e/aefailtest.py docker.io/alpine:latest "${exec_nextlinuxcli}"
+
+print_colorized INFO "Finished running Nextlinux CLI end-to-end tests."; echo
